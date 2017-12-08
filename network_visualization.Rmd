@@ -1,0 +1,374 @@
+---
+title: "fos-net network visualization"
+author: "Maureen Ritchey"
+output:
+  html_notebook:
+    theme: cosmo
+    toc: yes
+    toc_float: yes
+  html_document:
+    theme: cosmo
+    toc: yes
+    toc_float: yes
+---
+
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(network)
+library(sna)
+library(ggnet)
+```
+
+# Load & tidy data
+
+All of the data were generated using the Brain Connectivity Toolbox in Matlab. I'm importing it into R because it will make it easier to make the plots and run stats.
+
+```{r}
+rawdata <- read.csv('data/Fos counts - clean.csv')
+fosnet <- read.csv('data/fosnet_matrix_ALL.csv')
+nodevals <- read.csv('data/fosnet_nodevals_ALL.csv')
+
+fosnet$condition <- 'ALL'
+nodevals$condition <- 'ALL'
+targ.mod <- fosnet$target.module
+seed.mod <- fosnet$seed.module
+
+# Get the condition-specific data and add it to the dfs
+gatherData <- function(fosnet,whichdf,label) {
+  fosnet.new <- read.csv(paste0('data/fosnet_',whichdf,'_',label,'.csv'))
+  fosnet.new$condition <- label
+  if (whichdf=="matrix") {
+  fosnet.new$target.module <- targ.mod # replacing this because modules defined only by ALL
+  fosnet.new$seed.module <- seed.mod
+  }
+  fosnet <- rbind(fosnet,fosnet.new)
+}
+fosnet <- gatherData(fosnet,'matrix','SJ')
+fosnet <- gatherData(fosnet,'matrix','SA')
+fosnet <- gatherData(fosnet,'matrix','NJ')
+fosnet <- gatherData(fosnet,'matrix','Nad')
+
+nodevals <- gatherData(nodevals,'nodevals','SJ')
+nodevals <- gatherData(nodevals,'nodevals','SA')
+nodevals <- gatherData(nodevals,'nodevals','NJ')
+nodevals <- gatherData(nodevals,'nodevals','Nad')
+
+rawdata.long <- gather(rawdata,key=region,value=fos,10:38)
+
+# Add label info to dataframes
+seedkey <- 
+  select(fosnet,seed,seed.module,seed.group) %>%
+  mutate(seed.label = factor(paste0(seed.module,'.',seed.group,'.',seed)),
+         seed.ins = ifelse(seed=="AI"|seed=="DI"|seed=="GI","Insula","Not insula")) %>%
+  unique() %>%
+  arrange(seed.module,seed.group,seed) 
+
+targetkey <- 
+  mutate(seedkey,
+         target.module = seed.module,
+         target.label = seed.label,
+         target = seed,
+         target.group = seed.group,
+         target.ins = seed.ins) %>%
+  select(target,target.label,target.group,target.ins,target.module)
+
+fosnet %>%
+  left_join(seedkey) %>%
+  left_join(targetkey) -> fosnet
+
+fosnet$condition[fosnet$condition=="Nad"] <- "NA"
+fosnet$condition <- factor(fosnet$condition,levels=c("ALL","NJ","NA","SJ","SA"))
+
+nodevals$condition[nodevals$condition=="Nad"] <- "NA"
+nodevals$condition <- factor(nodevals$condition,levels=c("ALL","NJ","NA","SJ","SA"))
+
+```
+
+# Plot network, sorted by module assignment
+## Plot connection matrix
+
+This is the "connectivity" matrix, sorted by module assignment (as determined by a BCT community detection algorithm).
+
+```{r, fig.height=3, fig.width=3.5}
+
+# Getting ordered labels from ALL
+tmp <- fosnet[fosnet$condition=="ALL",]$target.label 
+myOrders.targ <- as.numeric(droplevels(tmp))
+
+tmp <- fosnet[fosnet$condition=="ALL",]$seed.label 
+myOrders.seed <- as.numeric(droplevels(tmp))
+
+# Function for plotting correlation matrix
+plotCorrMat <- function(fosnet,cond,lims=c(-1,1)) {
+  
+  fosnet %>%
+    filter(condition==cond) %>%
+    mutate(target.ordered=reorder(target,myOrders.targ), # this puts the targets in the same order
+           seed.ordered=reorder(seed,myOrders.seed),
+           seed.ordered=factor(seed.ordered,levels=rev(levels(seed.ordered))),
+           correlation=connection) %>% # this reverses seed so it goes from left top to bottom right
+    ggplot(aes(x=target.ordered,y=seed.ordered)) + geom_tile(aes(fill=correlation),colour = "white") + 
+    scale_fill_gradient2(low = "blue",mid="white",high = "red",midpoint=0,limits=lims) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, color="black")) +
+    theme(axis.text.y = element_text(color="black")) +
+    xlab("") + ylab("") + ggtitle(cond) -> p
+  
+  print(p)
+  
+  ggsave(paste0('figs/correlation_matrix_',cond,'.eps'),device="eps")
+  
+}
+
+
+plotCorrMat(fosnet,'ALL',c(-.7,.7))
+plotCorrMat(fosnet,'NJ')
+plotCorrMat(fosnet,'NA')
+plotCorrMat(fosnet,'SJ')
+plotCorrMat(fosnet,'SA')
+
+# Saving out the level orders for later...
+fosnet %>%
+    filter(condition=="ALL") %>%
+    mutate(target.ordered=reorder(target,myOrders.targ), # this puts the targets in the same order
+           seed.ordered=reorder(seed,myOrders.seed),
+           seed.ordered=factor(seed.ordered,levels=rev(levels(seed.ordered))),
+           correlation=connection) -> tmp
+tmplevels <- levels(tmp$seed.ordered)
+
+
+```
+
+### Summarize within and between module correlations
+```{r, fig.height=2.5, fig.width=1}
+fosnet %>%
+  mutate(conntype = factor(ifelse(seed.module==1 & target.module==1,'within module 1',
+                                  ifelse(seed.module==2 & target.module==2,'within module 2','between modules')),
+                           levels=c("within module 1","within module 2","between modules")),
+         connection = ifelse(seed==target,NA,connection)) %>%
+  filter(!is.na(connection)) %>%
+  group_by(condition,conntype) %>%
+  summarize(conn = mean(connection,na.rm=TRUE),
+            conn_n = length(!is.na(connection)),
+            connsem = sd(connection,na.rm=TRUE)/sqrt(length(!is.na(connection))/2), # dividing by two bc symmetric matrix
+            connsd = sd(connection,na.rm=TRUE),
+            connmin = min(connection,na.rm=TRUE),
+            connmax = max(connection,na.rm=TRUE)) %>%  
+  arrange(conntype,condition) -> summarymodcorr
+
+fosnet %>%
+  mutate(conntype = factor(ifelse(seed.module==1 & target.module==1,'within module 1',
+                                  ifelse(seed.module==2 & target.module==2,'within module 2','between modules')),
+                           levels=c("within module 1","within module 2","between modules")),
+         conn = ifelse(seed==target,NA,connection)) %>%
+  filter(!is.na(connection)) -> mod.replicates
+
+print(summarymodcorr)
+
+summarymodcorr %>%
+  ggplot(aes(x=condition,y=conn,fill=condition)) + geom_bar(stat="identity") + facet_wrap(~conntype,nrow=3,ncol=1) +
+  geom_errorbar(aes(x=condition,ymin=conn-connsem,ymax=conn+connsem),width=.25) + guides(fill=FALSE) + xlab('')
+
+ggsave(filename='figs/with_betw_mod_orig.png',device='png')
+
+
+mod.replicates %>%
+  ggplot(aes(x=condition,y=conn,fill=condition)) + geom_jitter(size=.4,alpha=.4,width=.1,aes(color=condition)) + 
+  facet_wrap(~conntype,nrow=3,ncol=1) +
+  guides(fill=FALSE,color=FALSE) + xlab('') +
+  geom_crossbar(mapping = aes(x = condition, y = conn),
+                  stat = "summary",
+                  fun.ymin = function(z) {quantile(z,0.25)},
+                  fun.ymax = function(z) {quantile(z,0.75)},
+                  fun.y = median,
+                  size=.3, alpha=0, width=.2) + theme_minimal() +
+  ylab("correlation")
+
+ggsave(filename='figs/with_betw_mod_quant.png',device='png',dpi=1200)
+
+
+```
+
+```{r, fig.height=1, fig.width=3.5}
+fosnet %>%
+  group_by(condition,seed.module,target.module) %>%
+  summarize(conn = mean(connection,na.rm=TRUE)) %>%
+  mutate(seed.mod=factor(seed.module,levels=c("2","1")),
+         target.mod=factor(target.module)) %>%
+  ggplot(aes(x=target.mod,y=seed.mod)) + 
+  geom_tile(aes(fill=conn),colour = "white") + 
+  scale_fill_gradient2(low = "blue",mid="white",high = "red",midpoint=0) +
+  facet_grid(.~condition) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color="black")) +
+  theme(axis.text.y = element_text(color="black")) + xlab('') + ylab('') +
+  theme_minimal() + labs(fill='mean corr')
+
+```
+
+## Plot network
+### Get network back into matrix format
+```{r}
+fosnet.mat <-
+  filter(fosnet,condition=="ALL") %>%
+  select(seed,target,connection) %>%
+  spread(target,connection)
+row.names(fosnet.mat) <- fosnet.mat$seed
+fosnet.mat <- select(fosnet.mat,-seed)
+```
+
+### Create the plot
+
+```{r, message=FALSE, warning=FALSE}
+
+thresh <- .2 # arbitrary, just for visualization
+set.seed(5) # for reproducibility
+
+plotNetwork <- function(mat,seedkey,threshold=thresh) {
+    mat[mat<threshold] <- 0
+    netplot <- network(mat)
+    
+    nodenames <- colnames(mat)
+    nodegroups <- data.frame(seed = nodenames) %>%
+      left_join(seedkey) %>%
+      select(seed.module) 
+    nodeoutline <- ifelse(nodenames=="AI"|nodenames=="DI"|nodenames=="GI","Insula","aa")
+    
+    netplot %v% "name" = nodenames
+    netplot %v% "group" = nodegroups$seed.module
+    netplot %v% "ins" = nodeoutline
+
+    print(ggnet2(netplot,label="name",label.size=1,color = "group",shape="ins",
+                 palette = "Accent", 
+                 size = 0) +
+            geom_point(aes(alpha = shape), size = 11) + scale_alpha_manual(values=c(0,0,1)) +
+            geom_point(aes(color = color), size = 9) +
+            geom_text(aes(label = label), color = "black") +
+            guides(alpha=FALSE,shape=FALSE,color=FALSE))
+
+}
+
+net <- plotNetwork(fosnet.mat,seedkey)
+
+ggsave('figs/network.eps',device="eps")
+
+
+```
+
+This plot is just another way of showing the connection matrix above. Since this format looks better with fewer connections, I applied an arbitrary threshold of `r thresh`.
+
+# Plot node metrics, ranked by value
+## Participation coefficient
+```{r, fig.height=1.5, fig.width=3}
+
+nodevals %>%
+  filter(condition=='ALL') %>%
+  mutate(seed = node) %>%
+  left_join(seedkey) %>%
+  filter(metric=="node_Ppos") %>%
+  mutate(node.ordered=reorder(node,meanval),
+         node.ordered=factor(node,levels=rev(levels(node.ordered)))) %>%
+  mutate(seed.module = factor(seed.module)) %>%
+  ggplot(aes(x=node.ordered,y=meanval)) + 
+  geom_bar(stat="identity",aes(color=seed.ins),fill="gray70") +
+  scale_color_manual(values=c("black","white")) +
+  ylab('Participation coefficient') + 
+  ggtitle('Participation coefficient - ALL') + 
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, color="black")) +
+  xlab('') +
+  guides(color=FALSE) -> p
+
+print(p)
+
+ggsave('figs/participation_coeff_ALL.eps',device="eps")
+
+```
+
+
+## Changes in participation coefficients
+```{r, fig.height=4, fig.width=4}
+
+nodevals %>%
+  filter(metric=="node_Ppos") %>% 
+  mutate(nodelab = factor(node,levels=rev(tmplevels))) %>%
+  ggplot(aes(x=condition,y=meanval,fill=condition)) + geom_bar(stat="identity") +
+  facet_wrap(~nodelab) + theme_minimal() + ylab('Participation coefficient') + xlab('')
+  
+```
+
+# Average fos within module & relate to behavior
+
+For this analysis, I'm going to summarize fos levels in the 3 insula regions. Then we can relate mean fos levels to behavior.
+
+## Calculate average fos values
+```{r, message=FALSE, warning=FALSE}
+
+# summarize within modules & insula
+rawdata.long %>%
+  mutate(seed=region) %>%
+  left_join(seedkey) %>%
+  mutate(seed.module.ins=ifelse(seed.ins=="Insula",'insula',paste0('mod_',seed.module))) %>%
+  filter(Condition=="ALL") %>%
+  group_by(RAT,seed.module.ins) %>%
+  summarize(meanFos = mean(fos,na.rm=TRUE)) %>%
+  filter(!is.na(seed.module.ins))  -> modulemeans
+
+# join with behavioral data
+behavvars <-
+  filter(rawdata,Condition=="ALL") %>%
+  mutate(stress=ifelse(stress==1,'naive','stressed'),
+         age=ifelse(age==1,'juvenile','adult')) %>%
+  select(1:9) 
+
+modulemeans <-
+  left_join(modulemeans,behavvars)
+
+```
+
+## Show correlation with behavioral measures
+
+```{r, fig.height=1.5, fig.width=2}
+
+modulemeans %>%
+  filter(seed.module.ins=="insula") %>%
+  ggplot(aes(x=meanFos,y=Social.Exploration)) + 
+  stat_smooth(method="lm",se=FALSE,color="gray") + 
+  geom_point(aes(color=age,shape=stress),size=2) + 
+  scale_color_manual(values=c("#bb996a","#97132c","#bb996a","#97132c")) +
+  ggtitle('Social exploration by mean fos') + theme_minimal() +
+  xlab('Insula: mean fos') +
+  ylab('Social exploration')
+
+ggsave('figs/scatterplot_insulafos_se.eps',device="eps")
+
+```
+
+
+
+## Regression predicting behavior
+
+Now let's run some actual stats relating fos to behavior.
+
+```{r}
+
+modulemeans %>%
+  group_by(seed.module.ins) %>%
+  mutate(zmeanFos = (meanFos - mean(meanFos,na.rm=TRUE))/sd(meanFos,na.rm=TRUE)) %>%
+  mutate(group = factor(interaction(stress,age)),
+         condition = factor(ifelse(group=="naive.adult","Naive adult",
+                                   ifelse(group=="naive.juvenile","Naive juvenile",
+                                          ifelse(group=="stressed.adult","Stressed adult",
+                                                 ifelse(group=="stressed.juvenile","Stressed juvenile",NA)))),
+                            levels=c("Naive juvenile","Naive adult","Stressed juvenile","Stressed adult")),
+         age = factor(age,levels=c("juvenile","adult"))) -> modulemeans
+
+
+modulemeans %>%
+  select(RAT,seed.module.ins,zmeanFos,Social.Exploration,stress,age) %>%
+  spread(seed.module.ins,zmeanFos) -> statdata
+
+model = lm(Social.Exploration ~ insula*stress*age, data=statdata)
+anova(model)
+
+```
+
